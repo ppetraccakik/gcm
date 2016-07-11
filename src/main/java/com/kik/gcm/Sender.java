@@ -63,7 +63,14 @@ import java.util.Map;
 import java.util.Random;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import org.apache.http.HttpEntity;
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClients;
 import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
+import org.apache.http.util.EntityUtils;
 import org.json.simple.JSONArray;
 import org.json.simple.JSONObject;
 import org.json.simple.JSONValue;
@@ -93,7 +100,7 @@ public class Sender
 
     private final String key;
 
-    private final PoolingHttpClientConnectionManager cm = new PoolingHttpClientConnectionManager();
+    private final PoolingHttpClientConnectionManager cm;
 
     /**
      * Default constructor.
@@ -104,6 +111,10 @@ public class Sender
     {
         this.key = nonNull(key);
 
+        // Initialize the HTTP pooled connections manager
+        cm = new PoolingHttpClientConnectionManager();
+        cm.setMaxTotal(100);
+        cm.setDefaultMaxPerRoute(100);
     }
 
     /**
@@ -154,6 +165,36 @@ public class Sender
         return result;
     }
 
+    public Result sendPooled(Message message, String to, int retries)
+        throws IOException
+    {
+        int attempt = 0;
+        Result result;
+        int backoff = BACKOFF_INITIAL_DELAY;
+        boolean tryAgain;
+        do {
+            attempt++;
+            if (logger.isLoggable(Level.FINE)) {
+                logger.fine("Attempt #" + attempt + " to send message "
+                    + message + " to regIds " + to);
+            }
+            result = sendPooledNoRetry(message, to);
+            tryAgain = result == null && attempt <= retries;
+            if (tryAgain) {
+                int sleepTime = backoff / 2 + random.nextInt(backoff);
+                sleep(sleepTime);
+                if (2 * backoff < MAX_BACKOFF_DELAY) {
+                    backoff *= 2;
+                }
+            }
+        } while (tryAgain);
+        if (result == null) {
+            throw new IOException("Could not send message after " + attempt
+                + " attempts");
+        }
+        return result;
+    }
+
     /**
      * Sends a message without retrying in case of service unavailability. See
      * {@link #send(Message, String, int)} for more info.
@@ -172,6 +213,84 @@ public class Sender
         messageToMap(message, jsonRequest);
         jsonRequest.put(JSON_TO, to);
         String responseBody = makeGcmHttpRequest(jsonRequest);
+        if (responseBody == null) {
+            return null;
+        }
+        JSONParser parser = new JSONParser();
+        JSONObject jsonResponse;
+        try {
+            jsonResponse = (JSONObject) parser.parse(responseBody);
+            Result.Builder resultBuilder = new Result.Builder();
+            if (jsonResponse.containsKey("results")) {
+                // Handle response from message sent to specific device.
+                JSONArray jsonResults = (JSONArray) jsonResponse.get("results");
+                if (jsonResults.size() == 1) {
+                    JSONObject jsonResult = (JSONObject) jsonResults.get(0);
+                    String messageId = (String) jsonResult.get(JSON_MESSAGE_ID);
+                    String canonicalRegId = (String) jsonResult.get(TOKEN_CANONICAL_REG_ID);
+                    String error = (String) jsonResult.get(JSON_ERROR);
+                    resultBuilder.messageId(messageId)
+                        .canonicalRegistrationId(canonicalRegId)
+                        .errorCode(error);
+                }
+                else {
+                    logger.log(Level.WARNING, "Found null or " + jsonResults.size()
+                        + " results, expected one");
+                    return null;
+                }
+            }
+            else if (to.startsWith(TOPIC_PREFIX)) {
+                if (jsonResponse.containsKey(JSON_MESSAGE_ID)) {
+                    // message_id is expected when this is the response from a topic message.
+                    Long messageId = (Long) jsonResponse.get(JSON_MESSAGE_ID);
+                    resultBuilder.messageId(messageId.toString());
+                }
+                else if (jsonResponse.containsKey(JSON_ERROR)) {
+                    String error = (String) jsonResponse.get(JSON_ERROR);
+                    resultBuilder.errorCode(error);
+                }
+                else {
+                    logger.log(Level.WARNING, "Expected " + JSON_MESSAGE_ID + " or " + JSON_ERROR
+                        + " found: " + responseBody);
+                    return null;
+                }
+            }
+            else if (jsonResponse.containsKey(JSON_SUCCESS) && jsonResponse.containsKey(JSON_FAILURE)) {
+                // success and failure are expected when response is from group message.
+                int success = getNumber(jsonResponse, JSON_SUCCESS).intValue();
+                int failure = getNumber(jsonResponse, JSON_FAILURE).intValue();
+                List<String> failedIds = null;
+                if (jsonResponse.containsKey("failed_registration_ids")) {
+                    JSONArray jFailedIds = (JSONArray) jsonResponse.get("failed_registration_ids");
+                    failedIds = new ArrayList<String>();
+                    for (int i = 0; i < jFailedIds.size(); i++) {
+                        failedIds.add((String) jFailedIds.get(i));
+                    }
+                }
+                resultBuilder.success(success).failure(failure)
+                    .failedRegistrationIds(failedIds);
+            }
+            else {
+                logger.warning("Unrecognized response: " + responseBody);
+                throw newIoException(responseBody, new Exception("Unrecognized response."));
+            }
+            return resultBuilder.build();
+        }
+        catch (ParseException e) {
+            throw newIoException(responseBody, e);
+        }
+        catch (CustomParserException e) {
+            throw newIoException(responseBody, e);
+        }
+    }
+
+    public Result sendPooledNoRetry(Message message, String to) throws IOException
+    {
+        nonNull(to);
+        Map<Object, Object> jsonRequest = new HashMap<Object, Object>();
+        messageToMap(message, jsonRequest);
+        jsonRequest.put(JSON_TO, to);
+        String responseBody = makePooledGcmHttpRequest(jsonRequest);
         if (responseBody == null) {
             return null;
         }
@@ -338,6 +457,81 @@ public class Sender
         return builder.build();
     }
 
+    public MulticastResult sendPooled(Message message, List<String> regIds, int retries)
+        throws IOException
+    {
+        int attempt = 0;
+        MulticastResult multicastResult;
+        int backoff = BACKOFF_INITIAL_DELAY;
+        // Map of results by registration id, it will be updated after each attempt
+        // to send the messages
+        Map<String, Result> results = new HashMap<String, Result>();
+        List<String> unsentRegIds = new ArrayList<String>(regIds);
+        boolean tryAgain;
+        List<Long> multicastIds = new ArrayList<Long>();
+        do {
+            multicastResult = null;
+            attempt++;
+            if (logger.isLoggable(Level.FINE)) {
+                logger.fine("Attempt #" + attempt + " to send message "
+                    + message + " to regIds " + unsentRegIds);
+            }
+            try {
+                multicastResult = sendPooledNoRetry(message, unsentRegIds);
+            }
+            catch (IOException e) {
+                // no need for WARNING since exception might be already logged
+                logger.log(Level.FINEST, "IOException on attempt " + attempt, e);
+            }
+            if (multicastResult != null) {
+                long multicastId = multicastResult.getMulticastId();
+                logger.fine("multicast_id on attempt # " + attempt + ": "
+                    + multicastId);
+                multicastIds.add(multicastId);
+                unsentRegIds = updateStatus(unsentRegIds, results, multicastResult);
+                tryAgain = !unsentRegIds.isEmpty() && attempt <= retries;
+            }
+            else {
+                tryAgain = attempt <= retries;
+            }
+            if (tryAgain) {
+                int sleepTime = backoff / 2 + random.nextInt(backoff);
+                sleep(sleepTime);
+                if (2 * backoff < MAX_BACKOFF_DELAY) {
+                    backoff *= 2;
+                }
+            }
+        } while (tryAgain);
+        if (multicastIds.isEmpty()) {
+            // all JSON posts failed due to GCM unavailability
+            throw new IOException("Could not post JSON requests to GCM after "
+                + attempt + " attempts");
+        }
+        // calculate summary
+        int success = 0, failure = 0, canonicalIds = 0;
+        for (Result result : results.values()) {
+            if (result.getMessageId() != null) {
+                success++;
+                if (result.getCanonicalRegistrationId() != null) {
+                    canonicalIds++;
+                }
+            }
+            else {
+                failure++;
+            }
+        }
+        // build a new object with the overall result
+        long multicastId = multicastIds.remove(0);
+        MulticastResult.Builder builder = new MulticastResult.Builder(success,
+            failure, canonicalIds, multicastId).retryMulticastIds(multicastIds);
+        // add results, in the same order as the input
+        for (String regId : regIds) {
+            Result result = results.get(regId);
+            builder.addResult(result);
+        }
+        return builder.build();
+    }
+
     /**
      * Updates the status of the messages sent to devices and the list of devices
      * that should be retried.
@@ -433,6 +627,56 @@ public class Sender
         }
     }
 
+    public MulticastResult sendPooledNoRetry(Message message,
+                                             List<String> registrationIds) throws IOException
+    {
+        if (nonNull(registrationIds).isEmpty()) {
+            throw new IllegalArgumentException("registrationIds cannot be empty");
+        }
+        Map<Object, Object> jsonRequest = new HashMap<Object, Object>();
+        messageToMap(message, jsonRequest);
+        jsonRequest.put(JSON_REGISTRATION_IDS, registrationIds);
+        String responseBody = makePooledGcmHttpRequest(jsonRequest);
+        if (responseBody == null) {
+            return null;
+        }
+        JSONParser parser = new JSONParser();
+        JSONObject jsonResponse;
+        try {
+            jsonResponse = (JSONObject) parser.parse(responseBody);
+            int success = getNumber(jsonResponse, JSON_SUCCESS).intValue();
+            int failure = getNumber(jsonResponse, JSON_FAILURE).intValue();
+            int canonicalIds = getNumber(jsonResponse, JSON_CANONICAL_IDS).intValue();
+            long multicastId = getNumber(jsonResponse, JSON_MULTICAST_ID).longValue();
+            MulticastResult.Builder builder = new MulticastResult.Builder(success,
+                failure, canonicalIds, multicastId);
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> results =
+                (List<Map<String, Object>>) jsonResponse.get(JSON_RESULTS);
+            if (results != null) {
+                for (Map<String, Object> jsonResult : results) {
+                    String messageId = (String) jsonResult.get(JSON_MESSAGE_ID);
+                    String canonicalRegId =
+                        (String) jsonResult.get(TOKEN_CANONICAL_REG_ID);
+                    String error = (String) jsonResult.get(JSON_ERROR);
+                    Result result = new Result.Builder()
+                        .messageId(messageId)
+                        .canonicalRegistrationId(canonicalRegId)
+                        .errorCode(error)
+                        .build();
+                    builder.addResult(result);
+                }
+            }
+            return builder.build();
+        }
+        catch (ParseException e) {
+            throw newIoException(responseBody, e);
+        }
+        catch (CustomParserException e) {
+            throw newIoException(responseBody, e);
+        }
+    }
+
     private String makeGcmHttpRequest(Map<Object, Object> jsonRequest) throws InvalidRequestException
     {
         String requestBody = JSONValue.toJSONString(jsonRequest);
@@ -470,6 +714,46 @@ public class Sender
         }
         logger.finest("JSON response: " + responseBody);
         return responseBody;
+    }
+
+    private String makePooledGcmHttpRequest(Map<Object, Object> jsonRequest) throws InvalidRequestException
+    {
+        String requestBody = JSONValue.toJSONString(jsonRequest);
+        logger.finest("JSON request: " + requestBody);
+
+        try (CloseableHttpResponse response = postUsingPooledConnection(GCM_SEND_ENDPOINT, "application/json", requestBody)) {
+            int status;
+            HttpEntity responseEntity = response.getEntity();
+            status = response.getStatusLine().getStatusCode();
+            String responseBody;
+            if (status != 200) {
+                try {
+                    responseBody = EntityUtils.toString(responseEntity, UTF8);
+                    logger.finest("JSON error response: " + responseBody);
+                }
+                catch (IOException e) {
+                    // ignore the exception since it will thrown an InvalidRequestException
+                    // anyways
+                    responseBody = "N/A";
+                    logger.log(Level.FINE, "Exception reading response: ", e);
+                }
+                throw new InvalidRequestException(status, responseBody);
+            }
+
+            try {
+                responseBody = EntityUtils.toString(responseEntity, UTF8);
+            }
+            catch (IOException e) {
+                logger.log(Level.WARNING, "IOException reading response", e);
+                return null;
+            }
+            logger.finest("JSON response: " + responseBody);
+            return responseBody;
+        }
+        catch (IOException e) {
+            logger.log(Level.FINE, "IOException posting to GCM", e);
+            return null;
+        }
     }
 
     /**
@@ -580,6 +864,12 @@ public class Sender
         return post(url, "application/x-www-form-urlencoded;charset=UTF-8", body);
     }
 
+    protected CloseableHttpResponse postUsingPooledConnection(String url, String body)
+        throws IOException
+    {
+        return postUsingPooledConnection(url, "application/x-www-form-urlencoded;charset=UTF-8", body);
+    }
+
     /**
      * Makes an HTTP POST request to a given endpoint.
      *
@@ -622,6 +912,29 @@ public class Sender
             close(out);
         }
         return conn;
+    }
+
+    protected CloseableHttpResponse postUsingPooledConnection(String url, String contentType, String body)
+        throws IOException
+    {
+        if (url == null || contentType == null || body == null) {
+            throw new IllegalArgumentException("arguments cannot be null");
+        }
+        if (!url.startsWith("https://")) {
+            logger.warning("URL does not use https: " + url);
+        }
+        logger.fine("Sending POST to " + url);
+        logger.finest("POST body: " + body);
+
+        HttpEntity entity = new StringEntity(body, UTF8);
+
+        HttpPost post = new HttpPost(url);
+        post.addHeader("Content-Type", contentType);
+        post.addHeader("Authorization", "key=" + key);
+        post.setEntity(entity);
+
+        CloseableHttpClient client = getPooledConnection();
+        return client.execute(post);
     }
 
     /**
@@ -667,6 +980,13 @@ public class Sender
     protected HttpURLConnection getConnection(String url) throws IOException
     {
         return (HttpURLConnection) new URL(url).openConnection();
+    }
+
+    protected CloseableHttpClient getPooledConnection()
+    {
+        return HttpClients.custom()
+            .setConnectionManager(cm)
+            .build();
     }
 
     /**
